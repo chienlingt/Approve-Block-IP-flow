@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+      xmlns:servicenow="http://www.mulesoft.org/schema/mule/servicenow"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/servicenow http://www.mulesoft.org/schema/mule/servicenow/current/mule-servicenow.xsd
+http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+    <!-- Configuration Properties -->
+    <configuration-properties file="config-dev.yaml" doc:name="Configuration properties"/>
+
+    <!-- HTTP Listener Configuration -->
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="8081" />
+    </http:listener-config>
+
+    <!-- ServiceNow Configuration -->
+    <servicenow:config name="ServiceNow_Config" doc:name="ServiceNow Config">
+        <servicenow:basic-connection
+            username="${servicenow.username}"
+            password="${servicenow.password}"
+            serviceAddress="${servicenow.serviceAddress}"/>
+    </servicenow:config>
+
+    <!-- Salesforce Configuration -->
+    <salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config" doc:id="3483a3a2-c36b-4fdd-b095-a41ba5ce7ba2" >
+		<salesforce:basic-connection 
+	    	username="${salesforce.username}" 
+	        password="${salesforce.password}${salesforce.securityToken}" 
+	    	url="https://login.salesforce.com/services/Soap/u/58.0"/>
+	</salesforce:sfdc-config>
+
+    <flow name="approve-block-ip-flow" doc:name="approve-block-ip-flow">
+
+	    <!-- HTTP Listener -->
+	    <http:listener
+	        config-ref="HTTP_Listener_config"
+	        path="/approve-block-ip"
+	        allowedMethods="POST"
+	        doc:name="Listener"/>
+	
+	    <!-- Log incoming request -->
+	    <logger level="INFO"
+	            message="Received Approve Block IP request: #[payload]"
+	            doc:name="Log Request"/>
+	
+	    <!-- Store variables -->
+	    <set-variable variableName="ipAddress" value="#[payload.ip_address]" doc:name="Set IP Address"/>
+	    <set-variable variableName="taskNumber" value="#[payload.task_number]" doc:name="Set Task Number"/>
+	    <set-variable variableName="caseId" value="#[payload.case_id default '']" doc:name="Set Case ID"/>
+	    <set-variable variableName="justification" value="#[payload.justification]" doc:name="Set Justification"/>
+	
+	    <logger level="INFO"
+	            message="Processing - IP: #[vars.ipAddress], Task: #[vars.taskNumber]"
+	            doc:name="Log Variables"/>
+	
+	    <!-- STEP 1: Create Block Visitor Record -->
+	    <ee:transform doc:name="Transform to Block Visitor">
+	        <ee:message>
+	            <ee:set-payload><![CDATA[%dw 2.0
+	output application/java
+	---
+	{
+	    Name: "Block_" ++ vars.ipAddress,
+	    From_IP_Address__c: vars.ipAddress,
+	    To_IP_Address__c: vars.ipAddress,
+	    Description__c: "Auto-blocked from ServiceNow " ++ vars.taskNumber ++ " - " ++ vars.justification,
+	    Owner_Type__c: "Admin",
+	    Is_Active__c: true
+	}]]></ee:set-payload>
+	        </ee:message>
+	    </ee:transform>
+	
+	    <logger level="INFO"
+	            message="Creating Block Visitor record"
+	            doc:name="Log Creation"/>
+	
+	    <salesforce:create
+	        type="Block_visitor__c"
+	        config-ref="Salesforce_Config"
+	        doc:name="Create Block Visitor">
+	        <salesforce:records>#[[payload]]</salesforce:records>
+	    </salesforce:create>
+	
+	    <logger level="INFO"
+	            message="Created Block Visitor with ID: #[payload[0].id]"
+	            doc:name="Log Success"/>
+	
+	    <set-variable variableName="blockVisitorId"
+	        value="#[payload[0].id]"
+	        doc:name="Set Block Visitor ID"/>
+	
+	    <!-- STEP 2: Success Response -->
+	    <ee:transform doc:name="Success Response">
+	        <ee:message>
+	            <ee:set-payload><![CDATA[%dw 2.0
+	output application/json
+	---
+	{
+	    status: "success",
+	    message: "IP Address " ++ vars.ipAddress ++ " has been approved and blocked in Salesforce",
+	    ipAddress: vars.ipAddress,
+	    taskNumber: vars.taskNumber,
+	    blockVisitorId: vars.blockVisitorId
+	}]]></ee:set-payload>
+	        </ee:message>
+	    </ee:transform>
+	
+	    <logger level="INFO"
+	            message="Returning success response"
+	            doc:name="Log Final Response"/>
+	
+	    <!-- Global Error Handler -->
+	    <error-handler>
+	        <on-error-propagate type="ANY">
+	            <logger level="ERROR" 
+	                    message="Flow error: #[error.description]"
+	                    doc:name="Log Flow Error"/>
+	
+	            <ee:transform doc:name="Error Response">
+	                <ee:message>
+	                    <ee:set-payload><![CDATA[%dw 2.0
+	output application/json
+	---
+	{
+	    status: "error",
+	    message: error.description,
+	    ipAddress: vars.ipAddress default "",
+	    taskNumber: vars.taskNumber default "",
+	    blockVisitorId: null
+	}]]></ee:set-payload>
+	                </ee:message>
+	            </ee:transform>
+	        </on-error-propagate>
+	    </error-handler>
+	
+	</flow>
+    
+</mule>
