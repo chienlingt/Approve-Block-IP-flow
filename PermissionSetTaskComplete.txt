@@ -1,0 +1,20 @@
+Hello ${u_requested_for.first_name},
+
+Your permission set request has been processed.
+
+Task Details:
+- Task Number: ${number}
+- Status: ${state}
+- Action: ${u_permission_set_action}
+- Permission Set: ${u_permission_set_name.u_label}
+- Requested For: ${u_requested_for.name}
+- Completed: ${sys_updated_on}
+
+Result:
+${work_notes}
+
+If you have any questions about this request, please contact SFDC.L3@email.com.
+
+Thank you,
+SFDC L3 Team
+
