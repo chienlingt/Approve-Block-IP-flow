@@ -141,5 +141,502 @@ http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mu
 	    </error-handler>
 	
 	</flow>
+	
+	<!-- Main Flow: Assign or Remove Permission Set -->
+	<flow name="assign-remove-permission-set-flow">
+	<http:listener 
+		doc:name="POST /api/salesforce/permission-set/assign" 
+		config-ref="HTTP_Listener_config" 
+		path="/api/salesforce/permission-set/assign" 
+		allowedMethods="POST"/>
+	
+	<logger level="INFO" doc:name="Log Request" 
+		message="#['Received request: Action=' ++ payload.action ++ ', PermissionSet=' ++ payload.permissionSetName ++ ', User=' ++ payload.userEmail]"/>
+	
+	<!-- Store request payload in variables -->
+	<set-variable value="#[payload.action]" doc:name="Set Action" variableName="action"/>
+	<set-variable value="#[payload.permissionSetName]" doc:name="Set Permission Set Name" variableName="permissionSetName"/>
+	<set-variable value="#[payload.userEmail]" doc:name="Set User Email" variableName="userEmail"/>
+	
+	<!-- Step 1: Find User by Username (email from ServiceNow = username in Salesforce) -->
+	<salesforce:query doc:name="Find User by Username" config-ref="Salesforce_Config">
+		<salesforce:salesforce-query>
+			<![CDATA[SELECT Id, Email, Name, Username, IsActive 
+			FROM User 
+			WHERE Username = ':userEmail' 
+			AND IsActive = true 
+			LIMIT 1]]>
+		</salesforce:salesforce-query>
+		<salesforce:parameters><![CDATA[#[output application/java
+---
+{
+	"userEmail" : vars.userEmail
+}]]]></salesforce:parameters>
+	</salesforce:query>
+	
+	<ee:transform doc:name="Store User Info">
+		<ee:message/>
+		<ee:variables>
+			<ee:set-variable variableName="userFound"><![CDATA[%dw 2.0
+output application/java
+---
+sizeOf(payload) > 0]]></ee:set-variable>
+			<ee:set-variable variableName="userId"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0) payload[0].Id else null]]></ee:set-variable>
+			<ee:set-variable variableName="userName"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0) payload[0].Name else null]]></ee:set-variable>
+			<ee:set-variable variableName="userSalesforceEmail"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0) payload[0].Email else null]]></ee:set-variable>
+		</ee:variables>
+	</ee:transform>
+	
+	<!-- Check if user was found -->
+	<choice doc:name="User Found?">
+		<when expression="#[vars.userFound == false]">
+			<logger level="ERROR" doc:name="Log User Not Found" 
+				message="#['User not found with username: ' ++ vars.userEmail]"/>
+			<ee:transform doc:name="User Not Found Response">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: false,
+	error: "User not found",
+	message: "No active Salesforce user found with username: " ++ vars.userEmail
+}]]></ee:set-payload>
+				</ee:message>
+				<ee:variables>
+					<ee:set-variable variableName="httpStatus">404</ee:set-variable>
+				</ee:variables>
+			</ee:transform>
+		</when>
+		<otherwise>
+			<!-- Step 2: Find Permission Set by Name -->
+			<salesforce:query doc:name="Find Permission Set" config-ref="Salesforce_Config">
+				<salesforce:salesforce-query>
+					<![CDATA[SELECT Id, Name, Label 
+					FROM PermissionSet 
+					WHERE Name = ':permissionSetName' 
+					LIMIT 1]]>
+				</salesforce:salesforce-query>
+				<salesforce:parameters><![CDATA[#[output application/java
+---
+{
+	"permissionSetName" : vars.permissionSetName
+}]]]></salesforce:parameters>
+			</salesforce:query>
+			
+			<ee:transform doc:name="Store Permission Set Info">
+				<ee:message/>
+				<ee:variables>
+					<ee:set-variable variableName="permissionSetFound"><![CDATA[%dw 2.0
+output application/java
+---
+sizeOf(payload) > 0]]></ee:set-variable>
+					<ee:set-variable variableName="permissionSetId"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0) payload[0].Id else null]]></ee:set-variable>
+					<ee:set-variable variableName="permissionSetLabel"><![CDATA[%dw 2.0
+output application/java
+---
+if (sizeOf(payload) > 0) payload[0].Label else null]]></ee:set-variable>
+				</ee:variables>
+			</ee:transform>
+			
+			<!-- Check if permission set was found -->
+			<choice doc:name="Permission Set Found?">
+				<when expression="#[vars.permissionSetFound == false]">
+					<logger level="ERROR" doc:name="Log Permission Set Not Found" 
+						message="#['Permission Set not found: ' ++ vars.permissionSetName]"/>
+					<ee:transform doc:name="Permission Set Not Found Response">
+						<ee:message>
+							<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: false,
+	error: "Permission Set not found",
+	message: "No Permission Set found with name: " ++ vars.permissionSetName
+}]]></ee:set-payload>
+						</ee:message>
+						<ee:variables>
+							<ee:set-variable variableName="httpStatus">404</ee:set-variable>
+						</ee:variables>
+					</ee:transform>
+				</when>
+				<otherwise>
+					<!-- Step 3: Check Action - Add or Remove -->
+					<choice doc:name="Add or Remove?">
+						<!-- ADD PERMISSION SET -->
+						<when expression="#[vars.action == 'Add Permission Set']">
+							<logger level="INFO" doc:name="Log Add Action" 
+								message="#['Adding Permission Set ' ++ vars.permissionSetLabel ++ ' to user ' ++ vars.userName]"/>
+							
+							<!-- Check if assignment already exists -->
+							<salesforce:query doc:name="Check Existing Assignment" config-ref="Salesforce_Config">
+								<salesforce:salesforce-query>
+									<![CDATA[SELECT Id 
+									FROM PermissionSetAssignment 
+									WHERE PermissionSetId = ':permissionSetId' 
+									AND AssigneeId = ':userId'
+									LIMIT 1]]>
+								</salesforce:salesforce-query>
+								<salesforce:parameters><![CDATA[#[output application/java
+---
+{
+	"permissionSetId" : vars.permissionSetId,
+	"userId" : vars.userId
+}]]]></salesforce:parameters>
+							</salesforce:query>
+							
+							<choice doc:name="Already Assigned?">
+								<when expression="#[sizeOf(payload) > 0]">
+									<logger level="WARN" doc:name="Log Already Assigned" 
+										message="#['Permission Set already assigned to user']"/>
+									<ee:transform doc:name="Already Assigned Response">
+										<ee:message>
+											<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: true,
+	action: "Add Permission Set",
+	message: "Permission Set '" ++ vars.permissionSetLabel ++ "' is already assigned to user " ++ vars.userName,
+	alreadyAssigned: true,
+	user: {
+		name: vars.userName,
+		servicenowEmail: vars.userEmail,
+		salesforceEmail: vars.userSalesforceEmail default "N/A",
+		id: vars.userId
+	},
+	permissionSet: {
+		name: vars.permissionSetName,
+		label: vars.permissionSetLabel,
+		id: vars.permissionSetId
+	}
+}]]></ee:set-payload>
+										</ee:message>
+									</ee:transform>
+								</when>
+								<otherwise>
+									<!-- Create new Permission Set Assignment -->
+									<ee:transform doc:name="Build Assignment Record">
+										<ee:message>
+											<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+	PermissionSetId: vars.permissionSetId,
+	AssigneeId: vars.userId
+}]]]></ee:set-payload>
+										</ee:message>
+									</ee:transform>
+									
+									<salesforce:create type="PermissionSetAssignment" 
+										doc:name="Create Permission Set Assignment" 
+										config-ref="Salesforce_Config"/>
+									
+									<ee:transform doc:name="Success Response - Added">
+										<ee:message>
+											<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: if (payload.items != null and sizeOf(payload.items) > 0) 
+		payload.items[0].successful default false
+	else if (payload[0] != null)
+		payload[0].successful default false
+	else 
+		false,
+	action: "Add Permission Set",
+	message: if (payload.items != null and sizeOf(payload.items) > 0)
+		if (payload.items[0].successful == true)
+			"Successfully assigned Permission Set '" ++ vars.permissionSetLabel ++ "' to user " ++ vars.userName
+		else if (payload.items[0].payload.errors != null and sizeOf(payload.items[0].payload.errors) > 0)
+			"Failed to assign Permission Set: " ++ payload.items[0].payload.errors[0].message
+		else
+			"Failed to assign Permission Set: Unknown error"
+	else if (payload[0] != null)
+		if (payload[0].successful == true)
+			"Successfully assigned Permission Set '" ++ vars.permissionSetLabel ++ "' to user " ++ vars.userName
+		else if (payload[0].errors != null and sizeOf(payload[0].errors) > 0)
+			"Failed to assign Permission Set: " ++ payload[0].errors[0].message
+		else
+			"Failed to assign Permission Set: Unknown error"
+	else
+		"Failed to assign Permission Set: Invalid response structure",
+	errorCode: if (payload.items != null and sizeOf(payload.items) > 0 and payload.items[0].successful == false)
+		payload.items[0].payload.errors[0].statusCode default null
+	else if (payload[0] != null and payload[0].errors != null and sizeOf(payload[0].errors) > 0)
+		payload[0].errors[0].statusCode default null
+	else 
+		null,
+	assignmentId: if (payload.items != null and sizeOf(payload.items) > 0) 
+		payload.items[0].id default null
+	else if (payload[0] != null)
+		payload[0].id default null
+	else 
+		null,
+	user: {
+		name: vars.userName,
+		servicenowEmail: vars.userEmail,
+		salesforceEmail: vars.userSalesforceEmail default "N/A",
+		id: vars.userId
+	},
+	permissionSet: {
+		name: vars.permissionSetName,
+		label: vars.permissionSetLabel,
+		id: vars.permissionSetId
+	}
+}]]></ee:set-payload>
+										</ee:message>
+									</ee:transform>
+									
+									<logger level="INFO" doc:name="Log Success" 
+										message="#['Successfully assigned Permission Set to user']"/>
+								</otherwise>
+							</choice>
+						</when>
+						
+						<!-- REMOVE PERMISSION SET -->
+						<when expression="#[vars.action == 'Remove Permission Set']">
+							<logger level="INFO" doc:name="Log Remove Action" 
+								message="#['Removing Permission Set ' ++ vars.permissionSetLabel ++ ' from user ' ++ vars.userName]"/>
+							
+							<!-- Find existing assignment -->
+							<salesforce:query doc:name="Find Assignment to Remove" config-ref="Salesforce_Config">
+								<salesforce:salesforce-query>
+									<![CDATA[SELECT Id 
+									FROM PermissionSetAssignment 
+									WHERE PermissionSetId = ':permissionSetId' 
+									AND AssigneeId = ':userId'
+									LIMIT 1]]>
+								</salesforce:salesforce-query>
+								<salesforce:parameters><![CDATA[#[output application/java
+---
+{
+	"permissionSetId" : vars.permissionSetId,
+	"userId" : vars.userId
+}]]]></salesforce:parameters>
+							</salesforce:query>
+							
+							<choice doc:name="Assignment Exists?">
+								<when expression="#[sizeOf(payload) == 0]">
+									<logger level="WARN" doc:name="Log Not Assigned" 
+										message="#['Permission Set not assigned to user']"/>
+									<ee:transform doc:name="Not Assigned Response">
+										<ee:message>
+											<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: true,
+	action: "Remove Permission Set",
+	message: "Permission Set '" ++ vars.permissionSetLabel ++ "' is not assigned to user " ++ vars.userName,
+	alreadyRemoved: true,
+	user: {
+		name: vars.userName,
+		servicenowEmail: vars.userEmail,
+		salesforceEmail: vars.userSalesforceEmail default "N/A",
+		id: vars.userId
+	},
+	permissionSet: {
+		name: vars.permissionSetName,
+		label: vars.permissionSetLabel,
+		id: vars.permissionSetId
+	}
+}]]></ee:set-payload>
+										</ee:message>
+									</ee:transform>
+								</when>
+								<otherwise>
+									<!-- Delete the assignment -->
+									<ee:transform doc:name="Get Assignment ID">
+										<ee:message/>
+										<ee:variables>
+											<ee:set-variable variableName="assignmentId"><![CDATA[%dw 2.0
+output application/java
+---
+payload[0].Id]]></ee:set-variable>
+										</ee:variables>
+									</ee:transform>
+									
+									<salesforce:delete doc:name="Delete Permission Set Assignment" 
+										config-ref="Salesforce_Config">
+										<salesforce:ids><![CDATA[#[[vars.assignmentId]]]]></salesforce:ids>
+									</salesforce:delete>
+									
+									<ee:transform doc:name="Success Response - Removed">
+										<ee:message>
+											<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: if (payload.items != null and sizeOf(payload.items) > 0) 
+		payload.items[0].successful default false
+	else if (payload[0] != null)
+		payload[0].successful default false
+	else 
+		false,
+	action: "Remove Permission Set",
+	message: if (payload.items != null and sizeOf(payload.items) > 0)
+		if (payload.items[0].successful == true)
+			"Successfully removed Permission Set '" ++ vars.permissionSetLabel ++ "' from user " ++ vars.userName
+		else if (payload.items[0].payload.errors != null and sizeOf(payload.items[0].payload.errors) > 0)
+			"Failed to remove Permission Set: " ++ payload.items[0].payload.errors[0].message
+		else
+			"Failed to remove Permission Set: Unknown error"
+	else if (payload[0] != null)
+		if (payload[0].successful == true)
+			"Successfully removed Permission Set '" ++ vars.permissionSetLabel ++ "' from user " ++ vars.userName
+		else if (payload[0].errors != null and sizeOf(payload[0].errors) > 0)
+			"Failed to remove Permission Set: " ++ payload[0].errors[0].message
+		else
+			"Failed to remove Permission Set: Unknown error"
+	else
+		"Failed to remove Permission Set: Invalid response structure",
+	user: {
+		name: vars.userName,
+		servicenowEmail: vars.userEmail,
+		salesforceEmail: vars.userSalesforceEmail default "N/A",
+		id: vars.userId
+	},
+	permissionSet: {
+		name: vars.permissionSetName,
+		label: vars.permissionSetLabel,
+		id: vars.permissionSetId
+	}
+}]]></ee:set-payload>
+										</ee:message>
+									</ee:transform>
+									
+									<logger level="INFO" doc:name="Log Success" 
+										message="#['Successfully removed Permission Set from user']"/>
+								</otherwise>
+							</choice>
+						</when>
+						
+						<!-- INVALID ACTION -->
+						<otherwise>
+							<logger level="ERROR" doc:name="Log Invalid Action" 
+								message="#['Invalid action: ' ++ vars.action]"/>
+							<ee:transform doc:name="Invalid Action Response">
+								<ee:message>
+									<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: false,
+	error: "Invalid action",
+	message: "Action must be 'Add Permission Set' or 'Remove Permission Set'. Received: " ++ vars.action
+}]]></ee:set-payload>
+								</ee:message>
+								<ee:variables>
+									<ee:set-variable variableName="httpStatus">400</ee:set-variable>
+								</ee:variables>
+							</ee:transform>
+						</otherwise>
+					</choice>
+				</otherwise>
+			</choice>
+		</otherwise>
+	</choice>
+	
+	<!-- Error Handler -->
+	<error-handler>
+		<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="ANY">
+			<logger level="ERROR" doc:name="Log Error" 
+				message="#['Error processing permission set request: ' ++ error.description]"/>
+			<ee:transform doc:name="Error Response">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: false,
+	error: error.errorType.asString,
+	message: error.description,
+	detailedMessage: error.detailedDescription default ""
+}]]></ee:set-payload>
+				</ee:message>
+				<ee:variables>
+					<ee:set-variable variableName="httpStatus">500</ee:set-variable>
+				</ee:variables>
+			</ee:transform>
+		</on-error-propagate>
+	</error-handler>
+</flow>
+
+<!-- Main Flow to Fetch Permission Sets -->
+	<flow name="get-permission-sets-flow">
+		<http:listener 
+			doc:name="GET /api/salesforce/permission-sets" 
+			config-ref="HTTP_Listener_config" 
+			path="/api/salesforce/permission-sets" 
+			allowedMethods="GET"/>
+		
+		<logger level="INFO" doc:name="Log Request" message="Fetching Permission Sets from Salesforce"/>
+		
+		<salesforce:query doc:name="Query Permission Sets (Not Groups)" config-ref="Salesforce_Config">
+			<salesforce:salesforce-query>
+				SELECT Id, Name, Label, Description, IsCustom, Type 
+				FROM PermissionSet 
+				WHERE IsCustom = true 
+				AND IsOwnedByProfile = false
+				ORDER BY Label ASC
+			</salesforce:salesforce-query>
+		</salesforce:query>
+		
+		<ee:transform doc:name="Filter Out Groups and Transform">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: true,
+	count: sizeOf(payload filter ($.Type != "Group")),
+	permission_sets: (payload filter ($.Type != "Group")) map {
+		value: $.Name,
+		label: $.Label,
+		description: $.Description default "",
+		id: $.Id,
+		type: $.Type
+	}
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		
+		<logger level="INFO" doc:name="Log Success" message="#['Successfully fetched ' ++ payload.count ++ ' permission sets']"/>
+		
+		<error-handler>
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate" type="ANY">
+				<ee:transform doc:name="Error Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	success: false,
+	error: error.description,
+	errorType: error.errorType.asString
+}]]></ee:set-payload>
+					</ee:message>
+					<ee:variables>
+						<ee:set-variable variableName="httpStatus">500</ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<logger level="ERROR" doc:name="Log Error" message="#['Error fetching permission sets: ' ++ error.description]"/>
+			</on-error-propagate>
+		</error-handler>
+	</flow>
+	
     
 </mule>
